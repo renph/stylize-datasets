@@ -1,17 +1,24 @@
 #!/usr/bin/env python
 import argparse
-from function import adaptive_instance_normalization
+from function import adaptive_instance_normalization, calc_mean_std
 import net
+from utils import ImageFolderWithPaths, collate
+from torch.utils.data import DataLoader, RandomSampler
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageFile
 import random
 import torch
 import torch.nn as nn
 import torchvision.transforms
 from torchvision.utils import save_image
 from tqdm import tqdm
+import os
 
-parser = argparse.ArgumentParser(description='This script applies the AdaIN style transfer method to arbitrary datasets.')
+Image.MAX_IMAGE_PIXELS = None  # Disable DecompressionBombError
+ImageFile.LOAD_TRUNCATED_IMAGES = True  # Disable OSError: image file is truncated
+
+parser = argparse.ArgumentParser(
+    description='This script applies the AdaIN style transfer method to arbitrary datasets.')
 parser.add_argument('--content-dir', type=str,
                     help='Directory path to a batch of content images')
 parser.add_argument('--style-dir', type=str,
@@ -23,7 +30,8 @@ parser.add_argument('--num-styles', type=int, default=1, help='Number of styles 
 parser.add_argument('--alpha', type=float, default=1.0,
                     help='The weight that controls the degree of \
                           stylization. Should be between 0 and 1')
-parser.add_argument('--extensions', nargs='+', type=str, default=['png', 'jpeg', 'jpg'], help='List of image extensions to scan style and content directory for (case sensitive), default: png, jpeg, jpg')
+parser.add_argument('--extensions', nargs='+', type=str, default=['png', 'jpeg', 'jpg'],
+                    help='List of image extensions to scan style and content directory for (case sensitive), default: png, jpeg, jpg')
 
 # Advanced options
 parser.add_argument('--content-size', type=int, default=0,
@@ -34,6 +42,9 @@ parser.add_argument('--style-size', type=int, default=512,
                     keeping the original size if set to 0')
 parser.add_argument('--crop', action='store_true',
                     help='do center crop to create squared image')
+parser.add_argument('--seed', type=int, default=1234,
+                    help='set random seed, default seed=1234')
+
 
 # random.seed(131213)
 
@@ -47,16 +58,30 @@ def input_transform(size, crop):
     transform = torchvision.transforms.Compose(transform_list)
     return transform
 
-def style_transfer(vgg, decoder, content, style, alpha=1.0):
-    assert (0.0 <= alpha <= 1.0)
-    content_f = vgg(content)
-    style_f = vgg(style)
-    feat = adaptive_instance_normalization(content_f, style_f)
-    feat = feat * alpha + content_f * (1 - alpha)
-    return decoder(feat)
 
-def main():
-    args = parser.parse_args()
+def content_feat_normalization(content_f):
+    size = content_f.data.size()
+    content_mean, content_std = calc_mean_std(content_f)
+    normalized_feat = (content_f -
+                       content_mean.expand(size)) / content_std.expand(size)
+    return normalized_feat
+
+
+def style_transfer(content_f, content_f_norm, style_f, alpha=1.0):
+    size = content_f.data.size()
+    style_mean, style_std = calc_mean_std(style_f)
+    feat = content_f_norm * style_std.expand(size) + style_mean.expand(size)
+    transfered_feat = feat * alpha + content_f * (1 - alpha)
+    return transfered_feat
+
+
+def main(args):
+    args = parser.parse_args(args)
+    assert (0.0 <= args.alpha <= 1.0), 'Alpha should be between 0 and 1'
+
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    # print(args.crop)
 
     # set content and style directories
     content_dir = Path(args.content_dir)
@@ -72,12 +97,14 @@ def main():
     content_dir = Path(content_dir)
     content_dir = content_dir.resolve()
     assert content_dir.is_dir(), 'Content directory not found'
-    dataset = []
-    for ext in extensions:
-        dataset += list(content_dir.rglob('*.' + ext))
 
-    assert len(dataset) > 0, 'No images with specified extensions found in content directory' + content_dir
-    content_paths = sorted(dataset)
+    # collect content files
+    contents = []
+    for ext in extensions:
+        contents += list(content_dir.rglob('*.' + ext))
+
+    assert len(contents) > 0, 'No images with specified extensions found in content directory' + content_dir
+    content_paths = sorted(contents)
     print('Found %d content images in %s' % (len(content_paths), content_dir))
 
     # collect style files
@@ -86,65 +113,90 @@ def main():
         styles += list(style_dir.rglob('*.' + ext))
 
     assert len(styles) > 0, 'No images with specified extensions found in style directory' + style_dir
-    styles = sorted(styles)
-    print('Found %d style images in %s' % (len(styles), style_dir))
+    style_paths = sorted(styles)
+    print('Found %d style images in %s' % (len(style_paths), style_dir))
+
+    del contents, styles
+
+    content_tf = input_transform(args.content_size, args.crop)
+    style_tf = input_transform(args.style_size, args.crop)
+
+    content_folder = ImageFolderWithPaths(root=args.content_dir,
+                                          paths=content_paths,
+                                          transform=content_tf)
+    style_folder = ImageFolderWithPaths(root=args.style_dir,
+                                        paths=style_paths,
+                                        transform=style_tf)
+
+    batch_size = 44 if args.content_size > 0 and args.crop else 1
+    content_loader = DataLoader(content_folder, batch_size,
+                                num_workers=4,
+                                collate_fn=collate)
+    style_loader = DataLoader(style_folder, batch_size,
+                              sampler=RandomSampler(style_folder, replacement=True),
+                              num_workers=4,
+                              collate_fn=collate)
 
     decoder = net.decoder
     vgg = net.vgg
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    decoder.eval()
-    vgg.eval()
 
     decoder.load_state_dict(torch.load('models/decoder.pth'))
     vgg.load_state_dict(torch.load('models/vgg_normalised.pth'))
     vgg = nn.Sequential(*list(vgg.children())[:31])
 
+    decoder.eval()
+    vgg.eval()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     vgg.to(device)
     decoder.to(device)
-
-    content_tf = input_transform(args.content_size, args.crop)
-    style_tf = input_transform(args.style_size, args.crop)
-
-
+    style_loader_iter = iter(style_loader)
+    count = 0
     # actual style transfer as in AdaIN
     with tqdm(total=len(content_paths) * args.num_styles) as pbar:
-        for content_path in content_paths:
-            for style_path in random.sample(styles, args.num_styles):
-                try:
-                    content_img = Image.open(content_path).convert('RGB')
-                    style_img = Image.open(style_path).convert('RGB')
-                except OSError as e:
-                    print('Skipping stylization of %s with %s due to error below' %(content_path, style_path))
-                    print(e)
-                    continue
-
-                content = content_tf(content_img)
-                style = style_tf(style_img)
-                style = style.to(device).unsqueeze(0)
-                content = content.to(device).unsqueeze(0)
+        for content_imgs, content_paths in content_loader:
+            # print(content_paths)
+            # save_image(content_imgs, '456.jpg', padding=0)
+            content_size = len(content_paths)
+            with torch.no_grad():
+                content_feat = vgg(content_imgs.to(device))
+                content_feat_norm = content_feat_normalization(content_feat)
+            for _ in range(args.num_styles):
+                style_imgs, style_paths = next(style_loader_iter)
+                # print(style_paths)
+                if content_size < len(style_paths):
+                    # make sure content_size == style_size in every batch
+                    style_imgs = style_imgs[:content_size]
                 with torch.no_grad():
-                    output = style_transfer(vgg, decoder, content, style,
-                                            args.alpha)
-                output = output.cpu()
+                    style_feat = vgg(style_imgs.to(device))
+                    output = decoder(
+                        style_transfer(content_feat, content_feat_norm,
+                                       style_feat, args.alpha)
+                    ).cpu()
+                for idx, (content_path, style_path) in enumerate(zip(content_paths, style_paths)):
+                    rel_path = content_path.relative_to(content_dir)
+                    out_dir = output_dir.joinpath(rel_path.parent)
+                    # create directory structure if it does not exist
+                    if not out_dir.is_dir():
+                        out_dir.mkdir(parents=True)
+                    content_name = content_path.stem
+                    style_name = style_path.stem
+                    output_name = out_dir.joinpath(f'{content_name}-stylized-{style_name}{content_path.suffix}')
+                    save_image(output[idx], output_name, padding=0)
+                    # if os.path.isfile(output_name):
+                    #     continue
+                    pbar.update(1)
+                count += content_size
+                if count >= 2000:
+                    return
 
-                rel_path = content_path.relative_to(content_dir)
-                out_dir = output_dir.joinpath(rel_path.parent)
-
-                # create directory structure if it does not exist
-                if not out_dir.is_dir():
-                    out_dir.mkdir(parents=True)
-
-                content_name = content_path.stem
-                style_name = style_path.stem
-                out_filename = content_name + '-stylized-' + style_name + content_path.suffix
-                output_name = out_dir.joinpath(out_filename)
-
-                save_image(output, output_name, padding=0) #default image padding is 2.
-                content_img.close()
-                style_img.close()
-                pbar.update(1)
 
 if __name__ == '__main__':
-    main()
+    args = None
+    # configuration
+    # args = ['--content-dir', r'/tmp/train', '--style-dir', r'/tmp/train', '--num-styles', '8',
+    #         # '--extensions', 'JPGE',
+    #         '--crop',
+    #         '--content-size', '128',
+    #         '--style-size', '128']
+    main(args)

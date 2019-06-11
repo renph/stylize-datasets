@@ -2,3 +2,4 @@ models/*.t7
 models/*.py
 __pycache__*
 .idea
+output/

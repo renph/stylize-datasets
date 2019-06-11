@@ -9,13 +9,14 @@ Feel free to open an issue in case there is any question.
 - Dependencies:
     - python >= 3.6
     - Pillow
-    - torch
+    - torch = 0.4.0 or >= 1.0
     - torchvision
     - tqdm  
 - Download and convert the models:
+    - **Update** Coverted `.pth` models are available in `models/`. No need to do this any more. Loading `.t7` models is not supported in pytorch 1.0.
     - for this step it is mandatory that your pytorch version is 0.4.0. Run `pip install torch==0.4.0` (preferrably in a container/virtual environment in order to not mess with your local pytorch installation)
     - run `bash download_convert_models.sh`
-    - Get style images: Download train.zip from [Kaggle's painter-by-numbers dataset](https://www.kaggle.com/c/painter-by-numbers/data)
+- Get style images: Download train.zip from [Kaggle's painter-by-numbers dataset](https://www.kaggle.com/c/painter-by-numbers/data)
 - To stylize a dataset, run `python stylize.py`.
 
     Arguments:
