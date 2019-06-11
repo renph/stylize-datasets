@@ -42,15 +42,19 @@ parser.add_argument('--style-size', type=int, default=512,
                     keeping the original size if set to 0')
 parser.add_argument('--crop', action='store_true',
                     help='do center crop to create squared image')
-parser.add_argument('--seed', type=int, default=1234,
-                    help='set random seed, default seed=1234')
+parser.add_argument('--batch-size', type=int, default=1,
+                    help='Number of images to process simultaneously. \
+                    Not working unless --content-size , --style-size are set to non-zero values,\
+                    and --crop is enabled.')
+parser.add_argument('--seed', type=int, default=-1,
+                    help='Set random seed, not working if set to negative integers, default: not set')
 
 
 # random.seed(131213)
 
 def input_transform(size, crop):
     transform_list = []
-    if size != 0:
+    if size > 0:
         transform_list.append(torchvision.transforms.Resize(size))
     if crop:
         transform_list.append(torchvision.transforms.CenterCrop(size))
@@ -78,9 +82,9 @@ def style_transfer(content_f, content_f_norm, style_f, alpha=1.0):
 def main(args):
     args = parser.parse_args(args)
     assert (0.0 <= args.alpha <= 1.0), 'Alpha should be between 0 and 1'
-
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    if args.seed >= 0:
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
     # print(args.crop)
 
     # set content and style directories
@@ -128,7 +132,7 @@ def main(args):
                                         paths=style_paths,
                                         transform=style_tf)
 
-    batch_size = 44 if args.content_size > 0 and args.crop else 1
+    batch_size = args.batch_size if args.content_size > 0 and args.style_size > 0 and args.crop else 1
     content_loader = DataLoader(content_folder, batch_size,
                                 num_workers=4,
                                 collate_fn=collate)
@@ -151,7 +155,7 @@ def main(args):
     vgg.to(device)
     decoder.to(device)
     style_loader_iter = iter(style_loader)
-    count = 0
+
     # actual style transfer as in AdaIN
     with tqdm(total=len(content_paths) * args.num_styles) as pbar:
         for content_imgs, content_paths in content_loader:
@@ -186,9 +190,6 @@ def main(args):
                     # if os.path.isfile(output_name):
                     #     continue
                     pbar.update(1)
-                count += content_size
-                if count >= 2000:
-                    return
 
 
 if __name__ == '__main__':
@@ -198,5 +199,6 @@ if __name__ == '__main__':
     #         # '--extensions', 'JPGE',
     #         '--crop',
     #         '--content-size', '128',
-    #         '--style-size', '128']
+    #         '--style-size', '128',
+    #         '--batch-size', '8']
     main(args)
